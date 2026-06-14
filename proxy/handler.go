@@ -1223,7 +1223,15 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 		closeActiveBlock()
 
-		if realInputTokens > 0 {
+		if cacheProfile != nil {
+			// When caching is active, cache_read/creation and the 85% cap are all
+			// computed in the byte-estimate token space (cacheProfile.TotalInputTokens).
+			// The upstream context-percentage reverse-estimate (realInputTokens) lives
+			// in a coarser space; using it as the denominator dilutes the reported hit
+			// rate (read / input) and breaks the 85% cap. Anchor input_tokens to the same
+			// estimate space the cache math used so the ratio stays internally consistent.
+			inputTokens = cacheProfile.TotalInputTokens
+		} else if realInputTokens > 0 {
 			inputTokens = realInputTokens
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
@@ -1493,7 +1501,11 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			rawThinkingContent = ""
 		}
 
-		if realInputTokens > 0 {
+		if cacheProfile != nil {
+			// See the streaming path: anchor input_tokens to the estimate space the
+			// cache math used so the hit rate (read / input) and 85% cap stay consistent.
+			inputTokens = cacheProfile.TotalInputTokens
+		} else if realInputTokens > 0 {
 			inputTokens = realInputTokens
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens

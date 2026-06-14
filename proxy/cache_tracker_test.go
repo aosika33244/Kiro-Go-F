@@ -378,3 +378,53 @@ func TestComputeCacheHitRate(t *testing.T) {
 		})
 	}
 }
+
+// TestCacheHitRateAnchoredToEstimateSpace locks the fix for hit-rate dilution:
+// when input_tokens is anchored to cacheProfile.TotalInputTokens (the same
+// byte-estimate space the cache math uses), the second-call hit rate
+// read / input must respect the 85% cap and the billed (uncached) input must
+// stay non-negative. Previously input_tokens came from the upstream
+// context-percentage reverse-estimate, a coarser/larger space, which diluted
+// read / input below the intended cap.
+func TestCacheHitRateAnchoredToEstimateSpace(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	profile := tracker.BuildClaudeProfile(buildLongCacheRequest(), 2048)
+	if profile == nil {
+		t.Fatalf("expected profile to be built")
+	}
+
+	// First call establishes the cache (creation only).
+	first := tracker.Compute("anchor-key", profile)
+	if first.CacheReadInputTokens != 0 {
+		t.Fatalf("expected no read on first call, got %+v", first)
+	}
+	tracker.Update("anchor-key", profile)
+
+	// Second identical call hits the cache.
+	second := tracker.Compute("anchor-key", profile)
+	if second.CacheReadInputTokens <= 0 {
+		t.Fatalf("expected cache read on second call, got %+v", second)
+	}
+
+	// Anchor input to the same estimate space the cache math used.
+	input := profile.TotalInputTokens
+	if input <= 0 {
+		t.Fatalf("expected positive TotalInputTokens, got %d", input)
+	}
+
+	// Billed (uncached) input must be non-negative — no underflow/truncation.
+	billed := billedClaudeInputTokens(input, second)
+	if billed < 0 {
+		t.Fatalf("billed input must be non-negative, got %d", billed)
+	}
+
+	// Hit rate read / input must respect the 85% cap (with a small tolerance for
+	// rounding) and must not be diluted far below it.
+	rate := float64(second.CacheReadInputTokens) / float64(input)
+	if rate > 0.90 {
+		t.Fatalf("hit rate %.3f exceeds the 85%% cap (read=%d input=%d)", rate, second.CacheReadInputTokens, input)
+	}
+	if rate < 0.50 {
+		t.Fatalf("hit rate %.3f looks diluted — input not anchored to estimate space (read=%d input=%d)", rate, second.CacheReadInputTokens, input)
+	}
+}
