@@ -52,10 +52,30 @@ type promptCacheEntry struct {
 	TTL       time.Duration
 }
 
+// sharedCacheScope is the fallback cache scope used when a request carries no
+// API key (legacy single-key path or unauthenticated path). All such traffic
+// shares one scope, which still allows multi-turn conversations to hit earlier
+// stored prefixes — strictly better than the previous per-account bucketing
+// that round-robin scattered across accounts.
+const sharedCacheScope = "__shared__"
+
+// cacheScope maps an API key ID to the cache scope used by the tracker.
+// Empty key IDs collapse to sharedCacheScope. The cache scope deliberately
+// follows the API key rather than the physical Kiro account: the upstream does
+// not return real cache tokens, so cache attribution is a local simulation that
+// is only meaningful per logical caller (the API key), not per round-robin
+// account.
+func cacheScope(apiKeyID string) string {
+	if apiKeyID == "" {
+		return sharedCacheScope
+	}
+	return apiKeyID
+}
+
 type promptCacheTracker struct {
-	mu               sync.Mutex
-	entriesByAccount map[string]map[[32]byte]promptCacheEntry
-	maxSupportedTTL  time.Duration
+	mu              sync.Mutex
+	entriesByScope  map[string]map[[32]byte]promptCacheEntry
+	maxSupportedTTL time.Duration
 }
 
 func newPromptCacheTracker(maxTTL time.Duration) *promptCacheTracker {
@@ -63,8 +83,8 @@ func newPromptCacheTracker(maxTTL time.Duration) *promptCacheTracker {
 		maxTTL = defaultPromptCacheTTL
 	}
 	return &promptCacheTracker{
-		entriesByAccount: make(map[string]map[[32]byte]promptCacheEntry),
-		maxSupportedTTL:  maxTTL,
+		entriesByScope:  make(map[string]map[[32]byte]promptCacheEntry),
+		maxSupportedTTL: maxTTL,
 	}
 }
 
@@ -125,8 +145,8 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 	}
 }
 
-func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfile) promptCacheUsage {
-	if t == nil || profile == nil || len(profile.Breakpoints) == 0 || accountID == "" {
+func (t *promptCacheTracker) Compute(scope string, profile *promptCacheProfile) promptCacheUsage {
+	if t == nil || profile == nil || len(profile.Breakpoints) == 0 || scope == "" {
 		return promptCacheUsage{}
 	}
 
@@ -139,9 +159,9 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 	defer t.mu.Unlock()
 	t.pruneExpiredLocked(now)
 
-	entries := t.entriesByAccount[accountID]
+	entries := t.entriesByScope[scope]
 	if len(entries) == 0 {
-		// First request for this account: report creation only if above threshold.
+		// First request for this scope: report creation only if above threshold.
 		effectiveCreation := lastTokens
 		if effectiveCreation < minTokens {
 			effectiveCreation = 0
@@ -193,8 +213,8 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 	}
 }
 
-func (t *promptCacheTracker) Update(accountID string, profile *promptCacheProfile) {
-	if t == nil || profile == nil || len(profile.Breakpoints) == 0 || accountID == "" {
+func (t *promptCacheTracker) Update(scope string, profile *promptCacheProfile) {
+	if t == nil || profile == nil || len(profile.Breakpoints) == 0 || scope == "" {
 		return
 	}
 
@@ -204,10 +224,10 @@ func (t *promptCacheTracker) Update(accountID string, profile *promptCacheProfil
 	defer t.mu.Unlock()
 	t.pruneExpiredLocked(now)
 
-	entries := t.entriesByAccount[accountID]
+	entries := t.entriesByScope[scope]
 	if entries == nil {
 		entries = make(map[[32]byte]promptCacheEntry)
-		t.entriesByAccount[accountID] = entries
+		t.entriesByScope[scope] = entries
 	}
 
 	for _, breakpoint := range profile.Breakpoints {
@@ -223,14 +243,14 @@ func (t *promptCacheTracker) Update(accountID string, profile *promptCacheProfil
 }
 
 func (t *promptCacheTracker) pruneExpiredLocked(now time.Time) {
-	for accountID, entries := range t.entriesByAccount {
+	for scope, entries := range t.entriesByScope {
 		for fingerprint, entry := range entries {
 			if !entry.ExpiresAt.After(now) {
 				delete(entries, fingerprint)
 			}
 		}
 		if len(entries) == 0 {
-			delete(t.entriesByAccount, accountID)
+			delete(t.entriesByScope, scope)
 		}
 	}
 }

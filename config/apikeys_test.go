@@ -188,7 +188,7 @@ func TestRecordApiKeyUsageConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < perGoroutine; i++ {
-				if err := RecordApiKeyUsage(created.ID, 7, 0.5); err != nil {
+				if err := RecordApiKeyUsage(created.ID, 7, 0.5, 0, 0, 0); err != nil {
 					atomic.AddInt32(&failures, 1)
 					return
 				}
@@ -227,7 +227,7 @@ func TestResetApiKeyUsage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("add: %v", err)
 	}
-	if err := RecordApiKeyUsage(created.ID, 100, 1.5); err != nil {
+	if err := RecordApiKeyUsage(created.ID, 100, 1.5, 80, 15, 5); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	if err := ResetApiKeyUsage(created.ID); err != nil {
@@ -239,6 +239,9 @@ func TestResetApiKeyUsage(t *testing.T) {
 	}
 	if got.TokensUsed != 0 || got.CreditsUsed != 0 || got.RequestsCount != 0 {
 		t.Fatalf("expected counters to be zeroed, got %+v", got)
+	}
+	if got.CacheReadTokens != 0 || got.CacheCreationTokens != 0 || got.UncachedInputTokens != 0 {
+		t.Fatalf("expected cache counters to be zeroed, got %+v", got)
 	}
 }
 

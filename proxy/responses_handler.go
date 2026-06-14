@@ -111,23 +111,25 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	kiroPayload := OpenAIToKiro(openaiReq, thinking)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
+	clientIP := clientIPFromRequest(r)
 	respID := generateResponseID()
 
 	if req.Stream {
 		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
-			apiKeyID, respID, &req, storedInputCopy, storeResponse)
+			apiKeyID, clientIP, respID, &req, storedInputCopy, storeResponse)
 		return
 	}
 
 	h.handleResponsesNonStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
-		apiKeyID, respID, &req, storedInputCopy, storeResponse)
+		apiKeyID, clientIP, respID, &req, storedInputCopy, storeResponse)
 }
 
 func (h *Handler) handleResponsesNonStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
-	estimatedInputTokens int, apiKeyID, respID string,
+	estimatedInputTokens int, apiKeyID, clientIP, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
+	startedAt := time.Now()
 	excluded := make(map[string]bool)
 	var lastErr error
 
@@ -185,9 +187,15 @@ func (h *Handler) handleResponsesNonStream(
 		}
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, promptCacheUsage{})
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.logRequest(requestLogParams{
+			apiKeyID: apiKeyID, clientIP: clientIP, model: model,
+			accountID: account.ID, accountEmail: account.Email, success: true,
+			inputTokens: inputTokens, outputTokens: outputTokens,
+			credits: credits, startedAt: startedAt,
+		})
 
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
 		respObj.StoredInput = storedInput
@@ -205,10 +213,18 @@ func (h *Handler) handleResponsesNonStream(
 	}
 
 	if lastErr == nil {
+		h.logRequest(requestLogParams{
+			apiKeyID: apiKeyID, clientIP: clientIP, model: model,
+			success: false, startedAt: startedAt, errMsg: "No available accounts",
+		})
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
 	h.recordFailure()
+	h.logRequest(requestLogParams{
+		apiKeyID: apiKeyID, clientIP: clientIP, model: model,
+		success: false, startedAt: startedAt, errMsg: lastErr.Error(),
+	})
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
@@ -271,9 +287,10 @@ func buildResponsesObject(
 
 func (h *Handler) handleResponsesStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
-	estimatedInputTokens int, apiKeyID, respID string,
+	estimatedInputTokens int, apiKeyID, clientIP, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
+	startedAt := time.Now()
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -530,9 +547,15 @@ func (h *Handler) handleResponsesStream(
 		}
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoning, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, promptCacheUsage{})
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.logRequest(requestLogParams{
+			apiKeyID: apiKeyID, clientIP: clientIP, model: model,
+			accountID: account.ID, accountEmail: account.Email, success: true,
+			inputTokens: inputTokens, outputTokens: outputTokens,
+			credits: credits, startedAt: startedAt,
+		})
 
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
 		respObj.CreatedAt = createdAt
@@ -555,6 +578,10 @@ func (h *Handler) handleResponsesStream(
 	}
 
 	if lastErr == nil {
+		h.logRequest(requestLogParams{
+			apiKeyID: apiKeyID, clientIP: clientIP, model: model,
+			success: false, startedAt: startedAt, errMsg: "No available accounts",
+		})
 		send("response.failed", map[string]interface{}{
 			"type": "response.failed",
 			"response": map[string]interface{}{
@@ -569,6 +596,10 @@ func (h *Handler) handleResponsesStream(
 		return
 	}
 	h.recordFailure()
+	h.logRequest(requestLogParams{
+		apiKeyID: apiKeyID, clientIP: clientIP, model: model,
+		success: false, startedAt: startedAt, errMsg: lastErr.Error(),
+	})
 	send("response.failed", map[string]interface{}{
 		"type": "response.failed",
 		"response": map[string]interface{}{

@@ -17,6 +17,13 @@
   const selectedAccounts = new Set();
   let filterKeyword = '';
   let filterStatus = 'all';
+  let accountsPage = 1;
+  const ACCOUNTS_PAGE_SIZE = 12;
+  let logsData = [];
+  let logsSinceSeq = 0;
+  let logsPollTimer = null;
+  const LOGS_MAX = 500;
+  const expandedLogSeqs = new Set();
   let privacyModeEnabled = true;
   let promptRules = [];
   let builderIdSession = '';
@@ -683,6 +690,98 @@
     renderAccounts();
   }
 
+  // loadLogs fetches request log entries incrementally (only entries newer than
+  // the last seen sequence number) and merges them into logsData, capping the
+  // client-side buffer at LOGS_MAX. Designed to be called on a short poll while
+  // the logs tab is visible.
+  async function loadLogs(reset) {
+    if (reset) {
+      logsSinceSeq = 0;
+      logsData = [];
+      expandedLogSeqs.clear();
+    }
+    let d;
+    try {
+      const res = await api('/logs?since=' + logsSinceSeq + '&limit=' + LOGS_MAX);
+      d = await res.json();
+    } catch {
+      return;
+    }
+    const incoming = Array.isArray(d.logs) ? d.logs : [];
+    if (incoming.length > 0) {
+      // Newest first in the UI; append then keep the most recent LOGS_MAX.
+      logsData = incoming.concat(logsData);
+      if (logsData.length > LOGS_MAX) logsData = logsData.slice(0, LOGS_MAX);
+    }
+    if (typeof d.latestSeq === 'number' && d.latestSeq > logsSinceSeq) {
+      logsSinceSeq = d.latestSeq;
+    }
+    renderLogs();
+  }
+
+  function renderLogs() {
+    const body = $('logsBody');
+    const empty = $('logsEmpty');
+    if (!body) return;
+    if (logsData.length === 0) {
+      body.innerHTML = '';
+      if (empty) empty.classList.remove('hidden');
+      return;
+    }
+    if (empty) empty.classList.add('hidden');
+    body.innerHTML = logsData.map(renderLogRow).join('');
+  }
+
+  function renderLogRow(e) {
+    const seq = e.seq;
+    const time = e.timestamp ? new Date(e.timestamp).toLocaleTimeString() : '';
+    const keyLabel = e.apiKeyName || (e.apiKeyId ? e.apiKeyId.slice(0, 8) : t('logs.noKey'));
+    const account = e.accountEmail ? getDisplayEmail(e.accountEmail, e.accountId || '') : '-';
+    const model = e.model || '-';
+    const statusCls = e.success ? 'logs-status-ok' : 'logs-status-err';
+    const statusTxt = e.success ? t('logs.success') : t('logs.failed');
+    const cache = formatNum(e.cacheReadTokens || 0) + ' / ' + formatNum(e.cacheCreationTokens || 0);
+    const credits = (e.credits || 0).toFixed(2);
+    const clickable = !e.success && e.error ? ' logs-row-clickable' : '';
+    const expanded = expandedLogSeqs.has(seq);
+    let html = '<tr class="logs-row' + clickable + '" data-log-seq="' + escapeAttr(seq) + '">' +
+      '<td class="logs-time">' + escapeHtml(time) + '</td>' +
+      '<td>' + escapeHtml(keyLabel) + '</td>' +
+      '<td>' + escapeHtml(account) + '</td>' +
+      '<td class="logs-model">' + escapeHtml(model) + '</td>' +
+      '<td><span class="logs-status ' + statusCls + '">' + escapeHtml(statusTxt) + '</span></td>' +
+      '<td class="logs-num">' + escapeHtml(credits) + '</td>' +
+      '<td class="logs-num">' + escapeHtml(formatNum(e.inputTokens || 0)) + '</td>' +
+      '<td class="logs-num">' + escapeHtml(formatNum(e.outputTokens || 0)) + '</td>' +
+      '<td class="logs-num">' + escapeHtml(cache) + '</td>' +
+      '<td class="logs-ip">' + escapeHtml(e.clientIp || '-') + '</td>' +
+      '</tr>';
+    if (!e.success && e.error && expanded) {
+      html += '<tr class="logs-error-row" data-log-error="' + escapeAttr(seq) + '">' +
+        '<td colspan="10"><pre class="logs-error-detail">' + escapeHtml(e.error) + '</pre></td></tr>';
+    }
+    return html;
+  }
+
+  function toggleLogError(seq) {
+    const n = Number(seq);
+    if (expandedLogSeqs.has(n)) expandedLogSeqs.delete(n);
+    else expandedLogSeqs.add(n);
+    renderLogs();
+  }
+
+  function startLogsPolling() {
+    stopLogsPolling();
+    const auto = $('logsAutoRefresh');
+    if (auto && !auto.checked) return;
+    logsPollTimer = setInterval(() => {
+      if ($('tabLogs') && !$('tabLogs').classList.contains('hidden')) loadLogs(false);
+    }, 2500);
+  }
+  function stopLogsPolling() {
+    if (logsPollTimer) { clearInterval(logsPollTimer); logsPollTimer = null; }
+  }
+
   // Account list
   function getFilteredAccounts() {
     return accountsData.filter(a => {
@@ -699,6 +798,7 @@
   function onFilterChange() {
     filterKeyword = $('filterSearch').value;
     filterStatus = $('filterStatusSelect').value;
+    accountsPage = 1;
     renderAccounts();
   }
   function toggleSelectAll(checked) {
@@ -817,9 +917,15 @@
     const filtered = getFilteredAccounts();
     if (filtered.length === 0) {
       container.innerHTML = '<div class="empty-state">' + escapeHtml(t('accounts.empty')) + '</div>';
+      renderAccountsPager(0, 0);
       return;
     }
-    container.innerHTML = filtered.map(a => {
+    const totalPages = Math.max(1, Math.ceil(filtered.length / ACCOUNTS_PAGE_SIZE));
+    if (accountsPage > totalPages) accountsPage = totalPages;
+    if (accountsPage < 1) accountsPage = 1;
+    const start = (accountsPage - 1) * ACCOUNTS_PAGE_SIZE;
+    const pageItems = filtered.slice(start, start + ACCOUNTS_PAGE_SIZE);
+    container.innerHTML = pageItems.map(a => {
       const usagePct = (a.usagePercent || 0) * 100;
       const usageClass = usagePct > 90 ? 'critical' : usagePct > 70 ? 'high' : '';
       const trialPct = (a.trialUsagePercent || 0) * 100;
@@ -888,6 +994,31 @@
     }).join('');
     applyUsageBars(container);
     enhanceCustomSelects(container);
+    renderAccountsPager(filtered.length, totalPages);
+  }
+
+  // renderAccountsPager draws the pagination controls below the account list.
+  // Hidden when there is only a single page. Page buttons are wired via a
+  // delegated handler (see wireEvents).
+  function renderAccountsPager(totalItems, totalPages) {
+    const pager = $('accountsPager');
+    if (!pager) return;
+    if (totalItems === 0 || totalPages <= 1) {
+      pager.innerHTML = '';
+      return;
+    }
+    const prevDisabled = accountsPage <= 1 ? ' disabled' : '';
+    const nextDisabled = accountsPage >= totalPages ? ' disabled' : '';
+    pager.innerHTML =
+      '<button type="button" class="btn btn-sm btn-outline" data-page-action="prev"' + prevDisabled + '>' +
+        escapeHtml(t('accounts.pagePrev')) + '</button>' +
+      '<span class="pager-info">' + escapeHtml(t('accounts.pageInfo', accountsPage, totalPages)) + '</span>' +
+      '<button type="button" class="btn btn-sm btn-outline" data-page-action="next"' + nextDisabled + '>' +
+        escapeHtml(t('accounts.pageNext')) + '</button>';
+  }
+  function gotoAccountsPage(delta) {
+    accountsPage += delta;
+    renderAccounts();
   }
 
   // Account actions
@@ -1605,6 +1736,31 @@
     return '<div class="text-xs muted-text">' + escapeHtml(label) + ': ' + escapeHtml(fmt(used)) + ' / ' + escapeHtml(fmt(limit)) + '</div>' + usageBar(used, limit);
   }
 
+  // renderCacheHitLine shows the simulated prompt-cache hit rate for an API key,
+  // plus a read/creation/uncached breakdown. Returns '' when no cacheable input
+  // has been recorded so empty keys stay uncluttered.
+  function renderCacheHitLine(item) {
+    const read = item.cacheReadTokens || 0;
+    const creation = item.cacheCreationTokens || 0;
+    const uncached = item.uncachedInputTokens || 0;
+    const total = read + creation + uncached;
+    if (total <= 0) return '';
+    const rate = typeof item.cacheHitRate === 'number' ? item.cacheHitRate : read / total;
+    const pct = Math.max(0, Math.min(100, rate * 100));
+    const color = pct >= 50 ? '#22c55e' : (pct >= 20 ? '#f59e0b' : '#ef4444');
+    const breakdown = escapeHtml(t('apiKeys.cacheRead')) + ' ' + escapeHtml(formatNumber(read)) +
+      ' · ' + escapeHtml(t('apiKeys.cacheWrite')) + ' ' + escapeHtml(formatNumber(creation)) +
+      ' · ' + escapeHtml(t('apiKeys.cacheUncached')) + ' ' + escapeHtml(formatNumber(uncached));
+    return '<div class="text-xs muted-text">' +
+        escapeHtml(t('apiKeys.cacheHitRate')) + ': ' +
+        '<span style="color:' + color + ';font-weight:600;">' + pct.toFixed(1) + '%</span>' +
+        ' <span class="muted-text">(' + breakdown + ')</span>' +
+      '</div>' +
+      '<div style="height:4px;border-radius:2px;overflow:hidden;background:rgba(148,163,184,0.25);margin-top:2px;">' +
+        '<div style="height:100%;width:' + pct + '%;background:' + color + ';transition:width 0.3s;"></div>' +
+      '</div>';
+  }
+
   function renderApiKeys() {
     const list = $('apiKeysList');
     if (!list) return;
@@ -1625,6 +1781,7 @@
       const tokensLine = usageLine(t('apiKeys.tokens'), item.tokensUsed || 0, item.tokenLimit || 0);
       const creditsLine = usageLine(t('apiKeys.credits'), item.creditsUsed || 0, item.creditLimit || 0);
       const requestsLine = '<div class="text-xs muted-text">' + escapeHtml(t('apiKeys.requests')) + ': ' + escapeHtml(formatNumber(item.requestsCount || 0)) + '</div>';
+      const cacheLine = renderCacheHitLine(item);
       return '<div class="card" data-apikey-id="' + id + '" style="margin-top:0.5rem;padding:0.75rem;">' +
         '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
           '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' +
@@ -1647,6 +1804,7 @@
           tokensLine +
           creditsLine +
           requestsLine +
+          cacheLine +
         '</div>' +
       '</div>';
     }).join('');
@@ -2185,7 +2343,7 @@
         return;
       }
     }
-    let ok = 0, fail = 0, newIds = [];
+    let ok = 0, fail = 0, dup = 0, newIds = [];
     for (const item of items) {
       if (!item.refreshToken) { fail++; continue; }
       let authMethod = item.authMethod || '';
@@ -2206,13 +2364,15 @@
       try {
         const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
         const d = await res.json();
-        if (d.success) { ok++; if (d.account?.id) newIds.push(d.account.id); }
+        if (d.success && d.skipped) { dup++; }
+        else if (d.success) { ok++; if (d.account?.id) newIds.push(d.account.id); }
         else fail++;
       } catch { fail++; }
     }
     closeModal(); loadAccounts(); loadStats();
     let msg = t('sso.importSuccess', ok);
     if (fail > 0) msg += t('sso.importPartial', fail);
+    if (dup > 0) msg += t('credentials.importDuplicate', dup);
     if (skipped > 0) msg += t('credentials.lineParseSkipped', skipped);
     toastPrimary(msg, { duration: 5200 });
     newIds.forEach(autoRefreshNewAccount);
@@ -2267,8 +2427,10 @@
       closeModal(); loadAccounts(); loadStats();
       const count = d.accounts?.length || 0;
       const errs = d.errors?.length || 0;
+      const dup = d.skipped?.length || 0;
       let msg = t('sso.importSuccess', count);
       if (errs > 0) msg += t('sso.importPartial', errs);
+      if (dup > 0) msg += t('credentials.importDuplicate', dup);
       toastPrimary(msg, { duration: 5200 });
       if (d.accounts) d.accounts.forEach(a => autoRefreshNewAccount(a.id));
     } else toastError(t('common.failed') + ': ' + (d.error || ''));
@@ -2573,6 +2735,12 @@
     qsa('.tab').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
     qsa('.tab-content').forEach(c => c.classList.add('hidden'));
     $('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.remove('hidden');
+    if (tab === 'logs') {
+      loadLogs(true);
+      startLogsPolling();
+    } else {
+      stopLogsPolling();
+    }
   }
 
   // Event wiring
@@ -2614,6 +2782,26 @@
     $('logoutBtn').addEventListener('click', logout);
 
     qsa('#tabBar .tab').forEach(tab => tab.addEventListener('click', () => switchTab(tab.dataset.tab)));
+
+    const logsBody = $('logsBody');
+    if (logsBody) {
+      logsBody.addEventListener('click', e => {
+        const row = e.target.closest('.logs-row-clickable');
+        if (!row) return;
+        toggleLogError(row.dataset.logSeq);
+      });
+    }
+    const logsClearBtn = $('logsClearBtn');
+    if (logsClearBtn) {
+      logsClearBtn.addEventListener('click', () => { logsData = []; expandedLogSeqs.clear(); renderLogs(); });
+    }
+    const logsAuto = $('logsAutoRefresh');
+    if (logsAuto) {
+      logsAuto.addEventListener('change', () => {
+        if (logsAuto.checked) startLogsPolling();
+        else stopLogsPolling();
+      });
+    }
 
     qsa('[data-copy]').forEach(btn => btn.addEventListener('click', async () => {
       const id = btn.dataset.copy;
@@ -2669,6 +2857,15 @@
       else if (action === 'test') testAccount(id);
       else if (action === 'delete') deleteAccount(id);
     });
+
+    const pager = $('accountsPager');
+    if (pager) {
+      pager.addEventListener('click', e => {
+        const btn = e.target.closest('[data-page-action]');
+        if (!btn || btn.disabled) return;
+        gotoAccountsPage(btn.dataset.pageAction === 'next' ? 1 : -1);
+      });
+    }
   }
 
   function bindSettingsEvents() {

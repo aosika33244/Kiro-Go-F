@@ -1622,8 +1622,8 @@ img.brand-icon {
   background: var(--card);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
-  padding: 1rem 1.25rem;
-  margin-bottom: 0.75rem;
+  padding: 0.6rem 0.85rem;
+  margin-bottom: 0.5rem;
   transition:
     border-color 0.15s,
     background-color 0.15s;
@@ -1644,7 +1644,7 @@ img.brand-icon {
   justify-content: space-between;
   align-items: flex-start;
   gap: 0.75rem;
-  margin-bottom: 0.75rem;
+  margin-bottom: 0.5rem;
   flex-wrap: wrap;
 }
 .account-info {
@@ -1710,8 +1710,8 @@ img.brand-icon {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   justify-items: center;
-  gap: 0.5rem;
-  padding-top: 0.75rem;
+  gap: 0.4rem;
+  padding-top: 0.5rem;
   border-top: 1px solid var(--border);
 }
 @media (max-width: 640px) {
@@ -1770,9 +1770,98 @@ img.brand-icon {
   letter-spacing: 0.04em;
 }
 
+/* Account pagination */
+.accounts-pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  margin-top: 0.5rem;
+}
+.accounts-pager:empty {
+  display: none;
+}
+.accounts-pager .pager-info {
+  font-size: 0.8125rem;
+  color: var(--muted-foreground);
+  font-feature-settings: "tnum";
+}
+
+/* Live request log */
+.logs-table-wrap {
+  overflow-x: auto;
+  margin-top: 0.5rem;
+}
+.logs-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+}
+.logs-table th,
+.logs-table td {
+  padding: 0.4rem 0.55rem;
+  text-align: left;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--border);
+}
+.logs-table th {
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted-foreground);
+  font-weight: 600;
+}
+.logs-table .logs-num {
+  text-align: right;
+  font-feature-settings: "tnum";
+}
+.logs-table .logs-time,
+.logs-table .logs-ip {
+  color: var(--muted-foreground);
+  font-feature-settings: "tnum";
+}
+.logs-table .logs-model {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.logs-row-clickable {
+  cursor: pointer;
+}
+.logs-row-clickable:hover {
+  background: color-mix(in oklab, var(--primary) 5%, transparent);
+}
+.logs-status {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 0.6875rem;
+  font-weight: 600;
+}
+.logs-status-ok {
+  background: rgba(34, 197, 94, 0.15);
+  color: #22c55e;
+}
+.logs-status-err {
+  background: rgba(239, 68, 68, 0.15);
+  color: #ef4444;
+}
+.logs-error-detail {
+  margin: 0;
+  padding: 0.5rem 0.75rem;
+  background: var(--background);
+  border-radius: var(--radius-sm);
+  color: #ef4444;
+  font-size: 0.75rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow: auto;
+}
+
 /* Usage bars */
 .account-usage {
-  margin: 0.5rem 0 0.75rem;
+  margin: 0.4rem 0 0.5rem;
 }
 .usage-label {
   font-size: 0.75rem;

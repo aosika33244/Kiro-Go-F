@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"kiro-go/config"
 	"strings"
 	"testing"
 	"time"
@@ -260,5 +261,120 @@ func TestPromptCacheImplicitBreakpointAtMessageEnd(t *testing.T) {
 	result := tracker.Compute("acct-1", profile2)
 	if result.CacheReadInputTokens == 0 {
 		t.Fatalf("expected cache read via implicit message-end breakpoint, got %+v", result)
+	}
+}
+
+// buildLongCacheRequest is a small helper for scope-focused tests: it produces a
+// request with a single long, cache_control-tagged system block so a stable
+// breakpoint above the min-cacheable threshold is guaranteed.
+func buildLongCacheRequest() *ClaudeRequest {
+	longSystem := strings.Repeat("You are a helpful coding assistant with deep knowledge of Go, Rust, Python, and TypeScript. ", 80)
+	return &ClaudeRequest{
+		Model: "claude-sonnet-4.5",
+		System: []interface{}{
+			map[string]interface{}{
+				"type": "text",
+				"text": longSystem,
+				"cache_control": map[string]interface{}{
+					"type": "ephemeral",
+				},
+			},
+		},
+		Messages: []ClaudeMessage{{Role: "user", Content: "hello world"}},
+	}
+}
+
+// TestPromptCacheScopeIsolation verifies that cache state is keyed by scope, not
+// account: a prefix stored under scope A must not be readable under scope B. This
+// is the core guarantee that lets the same logical caller (API key) hit its own
+// cache regardless of which round-robin account served the prior turn.
+func TestPromptCacheScopeIsolation(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	profile := tracker.BuildClaudeProfile(buildLongCacheRequest(), 2048)
+	if profile == nil {
+		t.Fatalf("expected profile to be built")
+	}
+
+	// Store under scope "key-A".
+	tracker.Update("key-A", profile)
+
+	// A different scope must see no cache read (creation only).
+	other := tracker.Compute("key-B", profile)
+	if other.CacheReadInputTokens != 0 {
+		t.Fatalf("expected zero cache read for a different scope, got %+v", other)
+	}
+
+	// The original scope still hits its own cache.
+	same := tracker.Compute("key-A", profile)
+	if same.CacheReadInputTokens <= 0 {
+		t.Fatalf("expected cache read within the same scope, got %+v", same)
+	}
+}
+
+// TestPromptCacheSameScopeAcrossAccounts is the regression test for the original
+// bug: with round-robin, turn 1 ran on account A and turn 2 on account B. When
+// the cache scope follows the API key (not the account), the second turn must
+// still read the cache the first turn created.
+func TestPromptCacheSameScopeAcrossAccounts(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	profile := tracker.BuildClaudeProfile(buildLongCacheRequest(), 2048)
+	if profile == nil {
+		t.Fatalf("expected profile to be built")
+	}
+
+	// Both turns use the same scope even though physical accounts differ.
+	scope := cacheScope("api-key-123")
+
+	first := tracker.Compute(scope, profile)
+	if first.CacheReadInputTokens != 0 {
+		t.Fatalf("expected no cache read on first turn, got %+v", first)
+	}
+	tracker.Update(scope, profile)
+
+	second := tracker.Compute(scope, profile)
+	if second.CacheReadInputTokens <= 0 {
+		t.Fatalf("expected cache read on second turn (same scope), got %+v", second)
+	}
+}
+
+// TestCacheScopeFallback verifies the empty-key fallback to the shared scope.
+func TestCacheScopeFallback(t *testing.T) {
+	if got := cacheScope(""); got != sharedCacheScope {
+		t.Fatalf("expected empty key ID to map to %q, got %q", sharedCacheScope, got)
+	}
+	if got := cacheScope("key-1"); got != "key-1" {
+		t.Fatalf("expected non-empty key ID to pass through, got %q", got)
+	}
+}
+
+func TestComputeCacheHitRate(t *testing.T) {
+	tests := []struct {
+		name string
+		e    config.ApiKeyEntry
+		want float64
+	}{
+		{"no usage", config.ApiKeyEntry{}, 0},
+		{
+			"all read",
+			config.ApiKeyEntry{CacheReadTokens: 100},
+			1,
+		},
+		{
+			"mixed",
+			config.ApiKeyEntry{CacheReadTokens: 80, CacheCreationTokens: 10, UncachedInputTokens: 10},
+			0.8,
+		},
+		{
+			"no read",
+			config.ApiKeyEntry{CacheCreationTokens: 50, UncachedInputTokens: 50},
+			0,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := computeCacheHitRate(tc.e); got != tc.want {
+				t.Fatalf("computeCacheHitRate = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

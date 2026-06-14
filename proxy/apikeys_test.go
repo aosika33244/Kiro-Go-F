@@ -121,7 +121,7 @@ func TestAuthenticateRejectsOverTokenLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := config.RecordApiKeyUsage(created.ID, 100, 0); err != nil {
+	if err := config.RecordApiKeyUsage(created.ID, 100, 0, 0, 0, 0); err != nil {
 		t.Fatalf("record usage: %v", err)
 	}
 	requireAuth(t)
@@ -152,7 +152,7 @@ func TestAuthenticateRejectsOverCreditLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := config.RecordApiKeyUsage(created.ID, 0, 1.0); err != nil {
+	if err := config.RecordApiKeyUsage(created.ID, 0, 1.0, 0, 0, 0); err != nil {
 		t.Fatalf("record usage: %v", err)
 	}
 	requireAuth(t)
@@ -243,7 +243,7 @@ func TestRouteWritesTooManyRequestsOpenAI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := config.RecordApiKeyUsage(created.ID, 50, 0); err != nil {
+	if err := config.RecordApiKeyUsage(created.ID, 50, 0, 0, 0, 0); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	requireAuth(t)
@@ -273,7 +273,10 @@ func TestRecordSuccessForApiKeyUpdatesEntry(t *testing.T) {
 	}
 
 	h := &Handler{}
-	h.recordSuccessForApiKey(created.ID, 25, 30, 0.75)
+	h.recordSuccessForApiKey(created.ID, 25, 30, 0.75, promptCacheUsage{
+		CacheReadInputTokens:     20,
+		CacheCreationInputTokens: 3,
+	})
 
 	got := config.GetApiKeyEntry(created.ID)
 	if got == nil {
@@ -288,6 +291,16 @@ func TestRecordSuccessForApiKeyUpdatesEntry(t *testing.T) {
 	if got.RequestsCount != 1 {
 		t.Fatalf("expected RequestsCount=1, got %d", got.RequestsCount)
 	}
+	if got.CacheReadTokens != 20 {
+		t.Fatalf("expected CacheReadTokens=20, got %d", got.CacheReadTokens)
+	}
+	if got.CacheCreationTokens != 3 {
+		t.Fatalf("expected CacheCreationTokens=3, got %d", got.CacheCreationTokens)
+	}
+	// inputTokens(25) - read(20) - creation(3) = 2 uncached
+	if got.UncachedInputTokens != 2 {
+		t.Fatalf("expected UncachedInputTokens=2, got %d", got.UncachedInputTokens)
+	}
 }
 
 func TestRecordSuccessForApiKeyEmptyIDIsNoop(t *testing.T) {
@@ -298,7 +311,7 @@ func TestRecordSuccessForApiKeyEmptyIDIsNoop(t *testing.T) {
 	}
 
 	h := &Handler{}
-	h.recordSuccessForApiKey("", 100, 100, 1)
+	h.recordSuccessForApiKey("", 100, 100, 1, promptCacheUsage{})
 	got := config.GetApiKeyEntry(created.ID)
 	if got == nil {
 		t.Fatalf("entry missing")

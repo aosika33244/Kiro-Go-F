@@ -21,22 +21,46 @@ type apiKeyView struct {
 	TokensUsed    int64   `json:"tokensUsed"`
 	CreditsUsed   float64 `json:"creditsUsed"`
 	RequestsCount int64   `json:"requestsCount"`
+
+	// Simulated prompt-cache analytics. CacheHitRate is derived (read / total
+	// input tokens) and ranges 0.0–1.0; it is 0 when no cacheable input has been
+	// recorded yet. The breakdown fields let the UI render read/creation/uncached
+	// proportions.
+	CacheReadTokens     int64   `json:"cacheReadTokens"`
+	CacheCreationTokens int64   `json:"cacheCreationTokens"`
+	UncachedInputTokens int64   `json:"uncachedInputTokens"`
+	CacheHitRate        float64 `json:"cacheHitRate"`
+}
+
+// computeCacheHitRate returns cacheRead / (cacheRead + cacheCreation + uncachedInput),
+// i.e. the fraction of input tokens served from cache. Returns 0 when no cacheable
+// input has been recorded.
+func computeCacheHitRate(e config.ApiKeyEntry) float64 {
+	total := e.CacheReadTokens + e.CacheCreationTokens + e.UncachedInputTokens
+	if total <= 0 {
+		return 0
+	}
+	return float64(e.CacheReadTokens) / float64(total)
 }
 
 func toApiKeyView(e config.ApiKeyEntry) apiKeyView {
 	return apiKeyView{
-		ID:            e.ID,
-		Name:          e.Name,
-		KeyMasked:     config.MaskApiKey(e.Key),
-		Enabled:       e.Enabled,
-		Migrated:      e.Migrated,
-		CreatedAt:     e.CreatedAt,
-		LastUsedAt:    e.LastUsedAt,
-		TokenLimit:    e.TokenLimit,
-		CreditLimit:   e.CreditLimit,
-		TokensUsed:    e.TokensUsed,
-		CreditsUsed:   e.CreditsUsed,
-		RequestsCount: e.RequestsCount,
+		ID:                  e.ID,
+		Name:                e.Name,
+		KeyMasked:           config.MaskApiKey(e.Key),
+		Enabled:             e.Enabled,
+		Migrated:            e.Migrated,
+		CreatedAt:           e.CreatedAt,
+		LastUsedAt:          e.LastUsedAt,
+		TokenLimit:          e.TokenLimit,
+		CreditLimit:         e.CreditLimit,
+		TokensUsed:          e.TokensUsed,
+		CreditsUsed:         e.CreditsUsed,
+		RequestsCount:       e.RequestsCount,
+		CacheReadTokens:     e.CacheReadTokens,
+		CacheCreationTokens: e.CacheCreationTokens,
+		UncachedInputTokens: e.UncachedInputTokens,
+		CacheHitRate:        computeCacheHitRate(e),
 	}
 }
 

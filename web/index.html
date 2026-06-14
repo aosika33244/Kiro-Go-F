@@ -107,6 +107,8 @@
                 data-i18n="tabs.settings"></span></button>
             <button type="button" class="tab" data-tab="api"><i class="fa-solid fa-plug tab-icon"></i><span
                 data-i18n="tabs.api"></span></button>
+            <button type="button" class="tab" data-tab="logs"><i class="fa-solid fa-list tab-icon"></i><span
+                data-i18n="tabs.logs"></span></button>
           </div>
         </nav>
         <div class="topbar-actions flex-wrap justify-end">
@@ -228,6 +230,7 @@
           </div>
 
           <div id="accountsList"></div>
+          <div id="accountsPager" class="accounts-pager"></div>
         </div>
       </div>
 
@@ -484,6 +487,42 @@
             </section>
           </div>
           <p class="api-hint"><i class="fa-solid fa-key"></i><span data-i18n="api.statsHint"></span></p>
+        </section>
+      </div>
+
+      <div id="tabLogs" class="tab-content hidden">
+        <section class="card">
+          <div class="card-header">
+            <span class="card-title" data-i18n="logs.title"></span>
+            <div class="flex items-center gap-2">
+              <label class="switch" title="" data-i18n-title="logs.autoRefresh">
+                <input type="checkbox" id="logsAutoRefresh" checked />
+                <span class="slider"></span>
+              </label>
+              <span class="text-xs muted-text" data-i18n="logs.autoRefresh"></span>
+              <button type="button" class="btn btn-sm btn-outline" id="logsClearBtn" data-i18n="logs.clear"></button>
+            </div>
+          </div>
+          <div class="logs-table-wrap">
+            <table class="logs-table" id="logsTable">
+              <thead>
+                <tr>
+                  <th data-i18n="logs.colTime"></th>
+                  <th data-i18n="logs.colKey"></th>
+                  <th data-i18n="logs.colAccount"></th>
+                  <th data-i18n="logs.colModel"></th>
+                  <th data-i18n="logs.colStatus"></th>
+                  <th data-i18n="logs.colCredits"></th>
+                  <th data-i18n="logs.colInput"></th>
+                  <th data-i18n="logs.colOutput"></th>
+                  <th data-i18n="logs.colCache"></th>
+                  <th data-i18n="logs.colIp"></th>
+                </tr>
+              </thead>
+              <tbody id="logsBody"></tbody>
+            </table>
+          </div>
+          <div id="logsEmpty" class="empty-state hidden" data-i18n="logs.empty"></div>
         </section>
       </div>
     </div>

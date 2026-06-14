@@ -157,8 +157,9 @@ func HasApiKeys() bool {
 }
 
 // RecordApiKeyUsage atomically adds tokens and credits to the entry's counters,
-// updates LastUsedAt, increments RequestsCount, and persists.
-func RecordApiKeyUsage(id string, tokens int64, credits float64) error {
+// accumulates the simulated prompt-cache breakdown (read / creation / uncached
+// input tokens), updates LastUsedAt, increments RequestsCount, and persists.
+func RecordApiKeyUsage(id string, tokens int64, credits float64, cacheRead, cacheCreation, uncachedInput int64) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	if cfg == nil {
@@ -172,6 +173,15 @@ func RecordApiKeyUsage(id string, tokens int64, credits float64) error {
 			if credits > 0 {
 				cfg.ApiKeys[i].CreditsUsed += credits
 			}
+			if cacheRead > 0 {
+				cfg.ApiKeys[i].CacheReadTokens += cacheRead
+			}
+			if cacheCreation > 0 {
+				cfg.ApiKeys[i].CacheCreationTokens += cacheCreation
+			}
+			if uncachedInput > 0 {
+				cfg.ApiKeys[i].UncachedInputTokens += uncachedInput
+			}
 			cfg.ApiKeys[i].RequestsCount++
 			cfg.ApiKeys[i].LastUsedAt = time.Now().Unix()
 			return saveLocked()
@@ -180,8 +190,9 @@ func RecordApiKeyUsage(id string, tokens int64, credits float64) error {
 	return errors.New("api key not found")
 }
 
-// ResetApiKeyUsage clears TokensUsed/CreditsUsed/RequestsCount for the entry.
-// LastUsedAt is preserved so operators can still see when the key was last used.
+// ResetApiKeyUsage clears TokensUsed/CreditsUsed/RequestsCount and the prompt-cache
+// analytics counters for the entry. LastUsedAt is preserved so operators can still
+// see when the key was last used.
 func ResetApiKeyUsage(id string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
@@ -193,6 +204,9 @@ func ResetApiKeyUsage(id string) error {
 			cfg.ApiKeys[i].TokensUsed = 0
 			cfg.ApiKeys[i].CreditsUsed = 0
 			cfg.ApiKeys[i].RequestsCount = 0
+			cfg.ApiKeys[i].CacheReadTokens = 0
+			cfg.ApiKeys[i].CacheCreationTokens = 0
+			cfg.ApiKeys[i].UncachedInputTokens = 0
 			return saveLocked()
 		}
 	}

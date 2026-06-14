@@ -141,6 +141,15 @@ type ApiKeyEntry struct {
 	TokensUsed    int64   `json:"tokensUsed,omitempty"`
 	CreditsUsed   float64 `json:"creditsUsed,omitempty"`
 	RequestsCount int64   `json:"requestsCount,omitempty"`
+
+	// Cumulative prompt-cache analytics (simulated; never auto-reset).
+	// The upstream does not return real cache tokens — these accumulate the
+	// locally computed cache breakdown so the admin panel can show a per-key
+	// cache hit rate. CacheReadTokens + CacheCreationTokens + UncachedInputTokens
+	// equals the cumulative billed input tokens.
+	CacheReadTokens     int64 `json:"cacheReadTokens,omitempty"`
+	CacheCreationTokens int64 `json:"cacheCreationTokens,omitempty"`
+	UncachedInputTokens int64 `json:"uncachedInputTokens,omitempty"`
 }
 
 // Config represents the global application configuration.
@@ -422,6 +431,33 @@ func AddAccount(account Account) error {
 	defer cfgLock.Unlock()
 	cfg.Accounts = append(cfg.Accounts, account)
 	return Save()
+}
+
+// FindAccountByIdentity returns an existing account matching the given identity,
+// or nil if none. userId takes priority over email so re-imports of the same
+// Kiro account are detected even when the email is unavailable. Empty inputs
+// never match (so accounts whose userId/email could not be resolved are not
+// collapsed together). Used by the import paths to skip duplicates.
+func FindAccountByIdentity(userId, email string) *Account {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if userId != "" {
+		for i := range cfg.Accounts {
+			if cfg.Accounts[i].UserId == userId {
+				cp := cfg.Accounts[i]
+				return &cp
+			}
+		}
+	}
+	if email != "" {
+		for i := range cfg.Accounts {
+			if cfg.Accounts[i].Email == email {
+				cp := cfg.Accounts[i]
+				return &cp
+			}
+		}
+	}
+	return nil
 }
 
 func UpdateAccount(id string, account Account) error {

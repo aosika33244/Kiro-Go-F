@@ -9,6 +9,7 @@ import (
 	"kiro-go/logger"
 	"kiro-go/pool"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -38,6 +39,7 @@ type Handler struct {
 	modelsCacheTime int64
 	promptCache     *promptCacheTracker
 	tokenRefreshMu  sync.Mutex
+	reqLog          *requestLogBuffer
 }
 
 type thinkingStreamSource int
@@ -225,6 +227,7 @@ func NewHandler() *Handler {
 		stopRefresh:     make(chan struct{}),
 		stopStatsSaver:  make(chan struct{}),
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
+		reqLog:          newRequestLogBuffer(500),
 	}
 	// 启动后台刷新
 	go h.backgroundRefresh()
@@ -817,15 +820,17 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
+	clientIP := clientIPFromRequest(r)
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, clientIP)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, clientIP)
 	}
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID, clientIP string) {
+	startedAt := time.Now()
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -841,6 +846,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 	msgID := "msg_" + uuid.New().String()
 	startInputTokens := estimatedInputTokens
+	scope := cacheScope(apiKeyID)
 	excluded := make(map[string]bool)
 	var lastErr error
 	messageStarted := false
@@ -877,7 +883,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			h.handleAccountFailure(account, err)
 			continue
 		}
-		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
+		cacheUsage := h.promptCache.Compute(scope, cacheProfile)
 		messageStartUsage = cacheUsage
 
 		var inputTokens, outputTokens int
@@ -1232,10 +1238,17 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 		outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, cacheUsage)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.promptCache.Update(account.ID, cacheProfile)
+		h.promptCache.Update(scope, cacheProfile)
+		h.logRequest(requestLogParams{
+			apiKeyID: apiKeyID, clientIP: clientIP, model: model,
+			accountID: account.ID, accountEmail: account.Email, success: true,
+			inputTokens: inputTokens, outputTokens: outputTokens,
+			cacheReadTokens: cacheUsage.CacheReadInputTokens, cacheCreationTokens: cacheUsage.CacheCreationInputTokens,
+			credits: credits, startedAt: startedAt,
+		})
 
 		stopReason := "end_turn"
 		if len(toolUses) > 0 {
@@ -1258,11 +1271,19 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	if lastErr == nil {
+		h.logRequest(requestLogParams{
+			apiKeyID: apiKeyID, clientIP: clientIP, model: model,
+			success: false, startedAt: startedAt, errMsg: "No available accounts",
+		})
 		h.sendClaudeError(w, 503, "api_error", "No available accounts")
 		return
 	}
 
 	h.recordFailure()
+	h.logRequest(requestLogParams{
+		apiKeyID: apiKeyID, clientIP: clientIP, model: model,
+		success: false, startedAt: startedAt, errMsg: lastErr.Error(),
+	})
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
 
@@ -1324,12 +1345,24 @@ func (h *Handler) recordSuccess(inputTokens, outputTokens int, credits float64) 
 // recordSuccessForApiKey is recordSuccess + per-API-key usage attribution.
 // When apiKeyID is empty (legacy single-key path or unauthenticated path), only the
 // global counters are updated. Persistence errors are logged but do not propagate.
-func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTokens int, credits float64) {
+//
+// cu carries the simulated prompt-cache breakdown for this request so the API key's
+// cache analytics (read / creation / uncached input tokens) can accumulate. Pass a
+// zero promptCacheUsage for paths that do not simulate caching (OpenAI / responses).
+func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTokens int, credits float64, cu promptCacheUsage) {
 	h.recordSuccess(inputTokens, outputTokens, credits)
 	if apiKeyID == "" {
 		return
 	}
-	if err := config.RecordApiKeyUsage(apiKeyID, int64(inputTokens+outputTokens), credits); err != nil {
+	uncachedInput := billedClaudeInputTokens(inputTokens, cu)
+	if err := config.RecordApiKeyUsage(
+		apiKeyID,
+		int64(inputTokens+outputTokens),
+		credits,
+		int64(cu.CacheReadInputTokens),
+		int64(cu.CacheCreationInputTokens),
+		int64(uncachedInput),
+	); err != nil {
 		logger.Warnf("[ApiKey] failed to record usage for key %s: %v", apiKeyID, err)
 	}
 }
@@ -1339,8 +1372,63 @@ func (h *Handler) recordFailure() {
 	atomic.AddInt64(&h.failedRequests, 1)
 }
 
+// requestLogParams carries the per-request fields needed to append a live request
+// log entry. Cache fields default to zero for paths that don't simulate caching.
+type requestLogParams struct {
+	apiKeyID            string
+	clientIP            string
+	model               string
+	accountID           string
+	accountEmail        string
+	success             bool
+	inputTokens         int
+	outputTokens        int
+	cacheReadTokens     int
+	cacheCreationTokens int
+	credits             float64
+	startedAt           time.Time
+	errMsg              string
+}
+
+// logRequest appends a completed request to the in-memory live log buffer.
+// Resolves the API key's display name (best effort) so the admin panel can show
+// a human-readable label. Never blocks the request path beyond a short mutex.
+func (h *Handler) logRequest(p requestLogParams) {
+	if h == nil || h.reqLog == nil {
+		return
+	}
+	apiKeyName := ""
+	if p.apiKeyID != "" {
+		if entry := config.GetApiKeyEntry(p.apiKeyID); entry != nil {
+			apiKeyName = entry.Name
+		}
+	}
+	var durationMs int64
+	if !p.startedAt.IsZero() {
+		durationMs = time.Since(p.startedAt).Milliseconds()
+	}
+	h.reqLog.Add(RequestLogEntry{
+		APIKeyID:            p.apiKeyID,
+		APIKeyName:          apiKeyName,
+		AccountID:           p.accountID,
+		AccountEmail:        p.accountEmail,
+		Model:               p.model,
+		ClientIP:            p.clientIP,
+		Success:             p.success,
+		InputTokens:         p.inputTokens,
+		OutputTokens:        p.outputTokens,
+		CacheReadTokens:     p.cacheReadTokens,
+		CacheCreationTokens: p.cacheCreationTokens,
+		Credits:             p.credits,
+		DurationMs:          durationMs,
+		Error:               p.errMsg,
+	})
+}
+
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID, clientIP string) {
+	startedAt := time.Now()
+	scope := cacheScope(apiKeyID)
 	excluded := make(map[string]bool)
 	var lastErr error
 
@@ -1355,7 +1443,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			h.handleAccountFailure(account, err)
 			continue
 		}
-		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
+		cacheUsage := h.promptCache.Compute(scope, cacheProfile)
 
 		var content string
 		var thinkingContent string
@@ -1412,10 +1500,17 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, cacheUsage)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.promptCache.Update(account.ID, cacheProfile)
+		h.promptCache.Update(scope, cacheProfile)
+		h.logRequest(requestLogParams{
+			apiKeyID: apiKeyID, clientIP: clientIP, model: model,
+			accountID: account.ID, accountEmail: account.Email, success: true,
+			inputTokens: inputTokens, outputTokens: outputTokens,
+			cacheReadTokens: cacheUsage.CacheReadInputTokens, cacheCreationTokens: cacheUsage.CacheCreationInputTokens,
+			credits: credits, startedAt: startedAt,
+		})
 
 		responseThinkingContent := rawThinkingContent
 		includeEmptyThinkingBlock := thinking && thinkingOpts.OmitDisplay && rawThinkingContent != ""
@@ -1451,11 +1546,19 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 	}
 
 	if lastErr == nil {
+		h.logRequest(requestLogParams{
+			apiKeyID: apiKeyID, clientIP: clientIP, model: model,
+			success: false, startedAt: startedAt, errMsg: "No available accounts",
+		})
 		h.sendClaudeError(w, 503, "api_error", "No available accounts")
 		return
 	}
 
 	h.recordFailure()
+	h.logRequest(requestLogParams{
+		apiKeyID: apiKeyID, clientIP: clientIP, model: model,
+		success: false, startedAt: startedAt, errMsg: lastErr.Error(),
+	})
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
 
@@ -1503,15 +1606,17 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	kiroPayload := OpenAIToKiro(&req, thinking)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
+	clientIP := clientIPFromRequest(r)
 	if req.Stream {
-		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, clientIP)
 	} else {
-		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, clientIP)
 	}
 }
 
 // handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID, clientIP string) {
+	startedAt := time.Now()
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1858,9 +1963,15 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			outputTokens += estimateApproxTokens(tc.Function.Arguments)
 		}
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, promptCacheUsage{})
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.logRequest(requestLogParams{
+			apiKeyID: apiKeyID, clientIP: clientIP, model: model,
+			accountID: account.ID, accountEmail: account.Email, success: true,
+			inputTokens: inputTokens, outputTokens: outputTokens,
+			credits: credits, startedAt: startedAt,
+		})
 
 		finishReason := "stop"
 		if len(toolCalls) > 0 {
@@ -1891,16 +2002,25 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	if lastErr == nil {
+		h.logRequest(requestLogParams{
+			apiKeyID: apiKeyID, clientIP: clientIP, model: model,
+			success: false, startedAt: startedAt, errMsg: "No available accounts",
+		})
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
 
 	h.recordFailure()
+	h.logRequest(requestLogParams{
+		apiKeyID: apiKeyID, clientIP: clientIP, model: model,
+		success: false, startedAt: startedAt, errMsg: lastErr.Error(),
+	})
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
-func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID, clientIP string) {
+	startedAt := time.Now()
 	excluded := make(map[string]bool)
 	var lastErr error
 
@@ -1961,9 +2081,15 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits, promptCacheUsage{})
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.logRequest(requestLogParams{
+			apiKeyID: apiKeyID, clientIP: clientIP, model: model,
+			accountID: account.ID, accountEmail: account.Email, success: true,
+			inputTokens: inputTokens, outputTokens: outputTokens,
+			credits: credits, startedAt: startedAt,
+		})
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
@@ -1973,11 +2099,19 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 	}
 
 	if lastErr == nil {
+		h.logRequest(requestLogParams{
+			apiKeyID: apiKeyID, clientIP: clientIP, model: model,
+			success: false, startedAt: startedAt, errMsg: "No available accounts",
+		})
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
 
 	h.recordFailure()
+	h.logRequest(requestLogParams{
+		apiKeyID: apiKeyID, clientIP: clientIP, model: model,
+		success: false, startedAt: startedAt, errMsg: lastErr.Error(),
+	})
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
@@ -2118,6 +2252,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetStats(w, r)
 	case path == "/stats/reset" && r.Method == "POST":
 		h.apiResetStats(w, r)
+	case path == "/logs" && r.Method == "GET":
+		h.apiGetRequestLogs(w, r)
 	case path == "/generate-machine-id" && r.Method == "GET":
 		h.apiGenerateMachineId(w, r)
 	case path == "/thinking" && r.Method == "GET":
@@ -2714,6 +2850,7 @@ func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
 	// 支持批量导入，按行分割
 	tokens := strings.Split(strings.TrimSpace(req.BearerToken), "\n")
 	var imported []map[string]interface{}
+	var skipped []map[string]interface{}
 	var errors []string
 
 	for _, token := range tokens {
@@ -2729,12 +2866,23 @@ func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// 获取用户信息
-		email, _, _ := auth.GetUserInfo(accessToken)
+		email, userID, _ := auth.GetUserInfo(accessToken)
+
+		// 去重：同一 Kiro 账号(userId 优先，email 回退)已存在则跳过。
+		if existing := config.FindAccountByIdentity(userID, email); existing != nil {
+			skipped = append(skipped, map[string]interface{}{
+				"id":     existing.ID,
+				"email":  existing.Email,
+				"userId": existing.UserId,
+			})
+			continue
+		}
 
 		// 创建账号
 		account := config.Account{
 			ID:           auth.GenerateAccountID(),
 			Email:        email,
+			UserId:       userID,
 			AccessToken:  accessToken,
 			RefreshToken: refreshToken,
 			ClientID:     clientID,
@@ -2759,7 +2907,7 @@ func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
 
 	h.pool.Reload()
 
-	if len(imported) == 0 && len(errors) > 0 {
+	if len(imported) == 0 && len(skipped) == 0 && len(errors) > 0 {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"success": false,
@@ -2771,6 +2919,7 @@ func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":  true,
 		"accounts": imported,
+		"skipped":  skipped,
 		"errors":   errors,
 	})
 }
@@ -2843,12 +2992,27 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 获取用户信息
-	email, _, _ := auth.GetUserInfo(accessToken)
+	email, userID, _ := auth.GetUserInfo(accessToken)
+
+	// 去重：同一 Kiro 账号(userId 优先，email 回退)已存在则跳过，避免重复导入。
+	if existing := config.FindAccountByIdentity(userID, email); existing != nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"skipped": true,
+			"account": map[string]interface{}{
+				"id":     existing.ID,
+				"email":  existing.Email,
+				"userId": existing.UserId,
+			},
+		})
+		return
+	}
 
 	// 创建账号
 	account := config.Account{
 		ID:           auth.GenerateAccountID(),
 		Email:        email,
+		UserId:       userID,
 		AccessToken:  accessToken,
 		RefreshToken: req.RefreshToken,
 		ClientID:     req.ClientID,
@@ -2888,6 +3052,30 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 		"totalTokens":     h.totalTokens,
 		"totalCredits":    h.totalCredits,
 		"uptime":          time.Now().Unix() - h.startTime,
+	})
+}
+
+// apiGetRequestLogs returns live request log entries from the in-memory ring
+// buffer. Supports incremental polling via ?since=<seq> (only entries with a
+// higher sequence number) and ?limit=<n> (most recent n entries). latestSeq is
+// echoed back so the client can use it as the next `since` cursor.
+func (h *Handler) apiGetRequestLogs(w http.ResponseWriter, r *http.Request) {
+	since := int64(0)
+	if v := r.URL.Query().Get("since"); v != "" {
+		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
+			since = parsed
+		}
+	}
+	limit := 200
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	logs := h.reqLog.Snapshot(since, limit)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"logs":      logs,
+		"latestSeq": h.reqLog.LatestSeq(),
 	})
 }
 

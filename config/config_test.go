@@ -55,7 +55,38 @@ func TestUpdateSettingsPatchCanExplicitlyDisableAPIKey(t *testing.T) {
 	}
 }
 
-// TestAccountAllowOverageMigration verifies that a config.json from before the
+func TestFindAccountByIdentity(t *testing.T) {
+	if err := Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+	if err := AddAccount(Account{ID: "a1", UserId: "user-1", Email: "a@example.com", Enabled: true}); err != nil {
+		t.Fatalf("add a1: %v", err)
+	}
+	if err := AddAccount(Account{ID: "a2", Email: "b@example.com", Enabled: true}); err != nil {
+		t.Fatalf("add a2: %v", err)
+	}
+
+	// userId match takes priority.
+	if got := FindAccountByIdentity("user-1", "other@example.com"); got == nil || got.ID != "a1" {
+		t.Fatalf("expected userId match a1, got %+v", got)
+	}
+	// email fallback when userId empty.
+	if got := FindAccountByIdentity("", "b@example.com"); got == nil || got.ID != "a2" {
+		t.Fatalf("expected email match a2, got %+v", got)
+	}
+	// email fallback when userId doesn't match any account.
+	if got := FindAccountByIdentity("unknown-user", "a@example.com"); got == nil || got.ID != "a1" {
+		t.Fatalf("expected email fallback a1, got %+v", got)
+	}
+	// no match.
+	if got := FindAccountByIdentity("nope", "nope@example.com"); got != nil {
+		t.Fatalf("expected no match, got %+v", got)
+	}
+	// empty inputs never match.
+	if got := FindAccountByIdentity("", ""); got != nil {
+		t.Fatalf("expected empty inputs to never match, got %+v", got)
+	}
+}
 // upstream-Overages-switch refactor (which carried `allowOverage: true` per
 // account) is migrated into OverageStatus="ENABLED" on first load, and that
 // the legacy field is cleared so future saves don't re-emit it.
